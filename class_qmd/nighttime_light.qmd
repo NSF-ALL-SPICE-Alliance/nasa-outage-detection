@@ -1,0 +1,553 @@
+---
+title: "nighttime_lights"
+author: "Faith & Ashley"
+format: html
+editor: visual
+---
+
+## **DS-422 Geocomputation: Kona Low Storms**
+
+**Research question:** How did the first Kona Low storm and second Kona Low storm differ in their impact on power outages on Oahu?
+
+***Sub questions:***
+
+1.  *Regionally, how did the impacts differ?*
+
+2.  *Did the outage patterns correlate with the storm's paths?*
+
+### Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+library(blackmarbler)
+library(sf)
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidyterra)
+library(lubridate)
+library(tigris)
+library(exactextractr)
+
+options(tigris_use_cache = TRUE)
+
+bearer <- Sys.getenv("NASA_BEARER")
+if (nchar(bearer) == 0) {
+  stop("NASA_BEARER not found. Run usethis::edit_r_environ(), add NASA_BEARER=your_token, then restart R.")
+}
+```
+
+### Dates
+
+Baseline: March 1 to March 7. Storm 1: March 10 to March 16. Gap: March 18. Storm 2: March 19 to March 24.
+
+```{r}
+all_dates <- list(
+  baseline = seq.Date(from = ymd("2026-03-01"), to = ymd("2026-03-07"), by = "day"),
+  storm1   = seq.Date(from = ymd("2026-03-10"), to = ymd("2026-03-16"), by = "day"),
+  gap      = ymd("2026-03-18"),
+  storm2   = seq.Date(from = ymd("2026-03-19"), to = ymd("2026-03-24"), by = "day")
+)
+```
+
+### Hawaii boundary
+
+Honolulu County's official boundary extends across the Northwestern Hawaiian Islands, hundreds of miles of open ocean, so it is cropped to Oahu itself. Without that crop every map would be mostly empty water and every islandwide average would be dragged toward zero.
+
+```{r}
+#| message: false
+#| warning: false
+
+roi_hawaii <- counties(state = "HI", cb = TRUE, year = 2022) |>
+  st_transform(4326) |>
+  st_crop(xmin = -160.5, xmax = -154.5, ymin = 18.5, ymax = 22.5) |>
+  filter(NAMELSAD != "Kalawao County") |>
+  mutate(county = gsub(" County", "", NAME))
+
+roi_sf <- roi_hawaii |>
+  filter(county == "Honolulu") |>
+  st_crop(xmin = -158.35, xmax = -157.60, ymin = 21.20, ymax = 21.75)
+
+plot(st_geometry(roi_sf), main = "Oahu region of interest")
+```
+
+### Pulling Black Marble rasters
+
+```{r}
+#| message: false
+#| warning: false
+#| cache: true
+
+r_list <- list()
+
+for (period in names(all_dates)) {
+  dates <- all_dates[[period]]
+
+  lst <- lapply(dates, function(d) {
+    tryCatch(#try catch skips missing values
+      bm_raster(roi_sf = roi_sf,
+                product_id = "VNP46A2",
+                quality_flag_rm = 2,
+                date = d,
+                bearer = bearer),
+      error = function(e) {
+        message("No imagery for ", d)
+        NULL
+      }
+    )
+  })
+
+  names(lst) <- as.character(dates)
+  lst <- lst[!sapply(lst, is.null)]
+
+  r <- rast(lst)
+  names(r) <- names(lst)
+  r_list[[period]] <- r
+}
+
+data.frame(
+  period    = names(all_dates),
+  requested = sapply(all_dates, length),
+  retrieved = sapply(r_list, nlyr)
+)
+```
+
+The baseline and second storm returned every night requested. The first storm returned four of seven: March 10, 11 and 12 have no usable imagery. Those are the opening nights of the storm, which is when outages would have been most widespread, so the first storm is measured from its recovery phase rather than its peak.
+
+### Masking
+
+Everything from here stays on the raw radiance scale. Logging before computing change would turn absolute change into a log ratio and make percent change uninterpretable.
+
+```{r}
+r_masked <- list()
+for (period in names(r_list)) {
+  r_masked[[period]] <- terra::mask(r_list[[period]], vect(roi_sf))
+}
+
+# Coverage per night: how much of Oahu survived the quality filter
+coverage <- do.call(rbind, lapply(names(r_masked), function(p) {
+  s <- r_masked[[p]]
+  data.frame(
+    date = as.Date(names(s)),
+    period = p,
+    n_valid = sapply(seq_len(nlyr(s)), function(i) sum(!is.na(values(s[[i]]))))
+  )
+}))
+
+coverage$pct_valid <- round(100 * coverage$n_valid / max(coverage$n_valid), 1)
+coverage
+```
+
+Every night that was delivered returned all of Oahu pixels. The expected problem with Kona Low is cloud coverage removing pixels unevenly across the island, with the heaviest rain areas dropping out first. That did not happen at the pixel level here. The data loss in this analysis is the missing nights rather than partial coverage within nights, so althought storm 1 has less statistical power, there isnt a spatial bias towards specific affected areas (assuming areas with more cloud coverage could be more heavilt afected.)
+
+### Period composites and change metrics
+
+Each period is collapsed to a mean across its nights, then two change metrics are computed against the baseline.
+
+Percent change asks what share of a pixel's normal light was lost, so that the difference is coverage in a dim neighborhood and for example downtown can be accurately compared. pixels below a brightness floor are masked out before dividing, which for example the kooalau ridges, so that they do not affect the percent change.
+
+The z-score asks how unusual a storm value is given how much that pixel normally fluctuates from night to night. It has the mirror-image failure: dividing by a near-zero standard deviation produces an enormous z-score, so a floor is applied to the standard deviation as well.
+
+```{r}
+period_mean <- list()
+for (period in names(r_masked)) {
+  period_mean[[period]] <- terra::mean(r_masked[[period]], na.rm = TRUE)
+}
+
+NOISE_FLOOR <- 5
+meaningful <- period_mean$baseline >= NOISE_FLOOR
+keep <- function(r) terra::mask(r, meaningful, maskvalues = FALSE)
+
+percent_storm1     <- keep((period_mean$storm1 - period_mean$baseline) / period_mean$baseline * 100)
+percent_storm2     <- keep((period_mean$storm2 - period_mean$baseline) / period_mean$baseline * 100)
+percent_gap        <- keep((period_mean$gap    - period_mean$baseline) / period_mean$baseline * 100)
+percent_storm2_gap <- keep((period_mean$storm2 - period_mean$gap)      / period_mean$gap      * 100)
+
+
+baseline_sd <- terra::app(r_masked$baseline, sd, na.rm = TRUE)
+sd_floor <- max(quantile(values(baseline_sd), 0.1, na.rm = TRUE), 1e-6)
+baseline_sd[baseline_sd <= sd_floor] <- NA
+
+z_score_storm1 <- keep((period_mean$storm1 - period_mean$baseline) / baseline_sd)
+z_score_storm2 <- keep((period_mean$storm2 - period_mean$baseline) / baseline_sd)
+z_score_gap    <- keep((period_mean$gap    - period_mean$baseline) / baseline_sd)
+
+print(minmax(percent_storm1))
+print(minmax(percent_storm2))
+print(minmax(z_score_storm1))
+print(minmax(z_score_storm2))
+```
+
+Percent change for Storm 1 spans roughly -55% to +58%, meaning the first storm's darkest pixels lost about half their light while a comparable number gained. Storm 2 spans -87% to +214%, a substantially wider and more negative range.
+
+The z-scores reach -54 for Storm 1 and -109 for Storm 2, which are far larger than any real anomaly. These come from pixels where the baseline standard deviation is very small but not small enough to be caught by the floor, which sits at about 0.03. A pixel that barely moved across seven baseline nights will produce an extreme z-score from a modest real change. This is why the maps below clip their color scale at the 1st and 99th percentiles, and why the regional means rather than the extremes matter.
+
+### Setting the noise floor from the data
+
+this table checks where a change stops being distinguishable from noise. If a brightness bin darkens at close to fifty percent, its pixels are effectively flipping a coin and carry no signal.
+
+```{r}
+paired <- data.frame(
+  baseline = values(period_mean$baseline)[, 1],
+  storm1   = values(period_mean$storm1)[, 1],
+  storm2   = values(period_mean$storm2)[, 1]
+) |>
+  filter(!is.na(baseline), !is.na(storm1), !is.na(storm2))
+
+paired |>
+  mutate(bin = cut(baseline, breaks = c(0, 2, 5, 10, 25, 75, Inf),
+                   labels = c("<2", "2-5", "5-10", "10-25", "25-75", "75+"))) |>
+  group_by(bin) |>
+  summarize(n = n(),
+            pct_dark_s1 = round(100 * mean(storm1 < baseline), 1),
+            pct_dark_s2 = round(100 * mean(storm2 < baseline), 1),
+            .groups = "drop")
+```
+
+In the very dim bins, only about a fifth of pixels got darker during either storm, meaning four out of five got brighter. Unlit terrain does not gain light during a storm, so this is an artifact rather than a real signal.
+
+Above the threshold the two storms separate clearly. Storm 1 darkens 40 to 53% of pixels, which is a coin flip and therefore not a detectable effect. Storm 2 darkens 62 to 75%. That contrast shows up before any composite or z-score is computed.
+
+### Daily maps
+
+The log transform is applied here for display only, since radiance is heavily right skewed.
+
+```{r}
+log_it <- function(r) { r[] <- log(r[] + 1); r }
+```
+
+```{r}
+### Map: baseline period, before the Kona Lows
+ggplot() +
+  geom_spatraster(data = log_it(r_masked$baseline)) +
+  facet_wrap(~lyr, ncol = 4) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  labs(title = "Oahu Nighttime Lights: March 1-7, 2026",
+       subtitle = "Baseline, before the first Kona Low") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+The baseline nights are consistent with each other, with the urban corridor from Kapolei through Honolulu clearly lit and the Koolau interior dark. That consistency is what makes a seven-night baseline usable as a reference.
+
+```{r}
+### Map: one panel per day, first storm
+ggplot() +
+  geom_spatraster(data = log_it(r_masked$storm1)) +
+  facet_wrap(~lyr, ncol = 2) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  labs(title = "Oahu Nighttime Lights: March 10-16, 2026",
+       subtitle = "First Kona Low storm") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+Only four nights appear because March 10 through 12 returned no imagery. Visually these nights are difficult to distinguish from the baseline.
+
+```{r}
+### Map: gap night between the storms
+ggplot() +
+  geom_spatraster(data = log_it(r_masked$gap)) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  labs(title = "Oahu Nighttime Lights: March 18, 2026",
+       subtitle = "Between the two Kona Low storms") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+March 18 looks visibly dimmer than either the baseline or the storm nights around it.
+
+```{r}
+### Map: one panel per day, second storm
+ggplot() +
+  geom_spatraster(data = log_it(r_masked$storm2)) +
+  facet_wrap(~lyr, ncol = 3) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  labs(title = "Oahu Nighttime Lights: March 19-24, 2026",
+       subtitle = "Second Kona Low storm") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+### Daily luminance
+
+Mean radiance is computed per night and plotted against the baseline level.
+
+```{r}
+daily <- do.call(rbind, lapply(names(r_masked), function(p) {
+  data.frame(
+    Date = as.Date(names(r_masked[[p]])),
+    Luminance = terra::global(r_masked[[p]], "mean", na.rm = TRUE)[, 1],
+    Period = p
+  )
+}))
+
+daily$Period <- factor(daily$Period,
+                       levels = c("baseline", "storm1", "gap", "storm2"),
+                       labels = c("Baseline", "First Kona Low", "Gap (Mar 18)", "Second Kona Low"))
+
+baseline_level <- mean(daily$Luminance[daily$Period == "Baseline"], na.rm = TRUE)
+
+ggplot(daily, aes(x = Date, y = Luminance, fill = Period)) +
+  geom_col() +
+  geom_hline(yintercept = baseline_level, linetype = "dashed", color = "grey30") +
+  scale_fill_manual(values = c("Baseline" = "gray70",
+                               "First Kona Low" = "steelblue",
+                               "Gap (Mar 18)" = "goldenrod",
+                               "Second Kona Low" = "maroon")) +
+  labs(title = "Oahu: Daily Mean Luminance, March 2026",
+       subtitle = "Dashed line marks the pre-storm baseline",
+       x = "Date", y = "Mean radiance", fill = "Period") +
+  theme_minimal()
+```
+
+Two things stand out. The Storm 1 bars sit at essentially the baseline level, reinforcing that no islandwide darkening is detectable during the nights available. And the March 18 gap bar is the lowest in the entire series, roughly 5 against a baseline near 7.
+
+That gap value should be the recovery night. However, because its just based on a single night rather than multiple nights, it carries more noise than the other bar and might not be a good statistical comparison.
+
+### Percent change maps
+
+```{r}
+map_change <- function(r, ttl, sub, lgd) {
+  v <- values(r)
+  lim <- max(abs(quantile(v[is.finite(v)], c(0.01, 0.99), na.rm = TRUE)))
+  ggplot() +
+    geom_spatraster(data = r) +
+    geom_sf(data = roi_sf, fill = NA, color = "black", linewidth = 0.2) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = 0, limits = c(-lim, lim),
+                         oob = scales::squish, na.value = "transparent",
+                         name = lgd) +
+    labs(title = ttl, subtitle = sub) +
+    coord_sf() +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5))
+}
+
+map_change(percent_storm1, "Percent Change in Nighttime Lights",
+           "First Kona Low storm vs. baseline", "Percent change")
+```
+
+Storm 1 shows red and blue scattered in roughly equal measure with no coherent spatial structure. (null)
+
+```{r}
+map_change(percent_storm2, "Percent Change in Nighttime Lights",
+           "Second Kona Low storm vs. baseline", "Percent change")
+```
+
+storm 2 shows a clear blue concentration through Central Oahu, the Windward coast around Kaneohe and Kailua, and the southeast around Hawaii Kai.
+
+```{r}
+map_change(percent_storm2_gap, "Percent Change in Nighttime Lights",
+           "Second Kona Low storm vs. gap day", "Percent change")
+```
+
+This panel compares Storm 2 to the March 18 gap night rather than to the baseline, so its heavy red simply reflects that the gap night was anomalously dark. It is not a accurate reflection of storm coverage.
+
+### Z-score maps
+
+The z score scales each pixels change by its own baseline variability, so a small change in a normally stable place registers more significantly than if that small change occurered in a area that varies more night to night.
+
+```{r}
+map_change(z_score_storm1, "Radiance Z-Score",
+           "First Kona Low storm vs. baseline", "Z-score")
+```
+
+```{r}
+map_change(z_score_storm2, "Radiance Z-Score",
+           "Second Kona Low storm vs. baseline", "Z-score")
+```
+
+The Storm 2 z score map concentrates its strongest negative values on the Windward side and the North Shore.
+
+### Which storm hit each area harder
+
+I want these visual findings to be confirmed numerically rather than only based on the maps.
+
+```{r}
+z_diff <- z_score_storm1 - z_score_storm2
+v <- values(z_diff)
+lim <- max(abs(quantile(v[is.finite(v)], c(0.01, 0.99), na.rm = TRUE)))
+
+ggplot() +
+  geom_spatraster(data = z_diff) +
+  geom_sf(data = roi_sf, fill = NA, color = "black", linewidth = 0.2) +
+  scale_fill_gradient2(low = "darkred", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-lim, lim),
+                       oob = scales::squish, na.value = "transparent",
+                       name = "Storm 1 z\nminus\nStorm 2 z") +
+  labs(title = "Which Kona Low Darkened Each Part of Oahu More",
+       subtitle = "Red: first storm hit harder. Blue: second storm hit harder.") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Subtracting the two z score rasters gives a per pixel ranking of which storm darkened each location more, which is possible since they both share a baseline term. Blue dominance across the map indicates Storm 2 was the more damaging of the two nearly everywhere.
+
+### Change by community
+
+Census designated places allow specific named neighborhoods to be compared directly rather than reading values off a raster by eye. Communities are grouped into island regions to understand the storms impacts specific to communities.
+
+```{r}
+#| message: false
+#| warning: false
+
+oahu_places <- places(state = "HI", cb = TRUE, year = 2022) |>
+  st_transform(4326) |>
+  st_filter(roi_sf, .predicate = st_intersects)
+
+extract_mean <- function(r, colname) {
+  out <- exact_extract(r, oahu_places, fun = "mean",
+                       append_cols = "NAME", progress = FALSE)
+  names(out)[names(out) == "mean"] <- colname
+  out
+}
+
+region_lookup <- data.frame(
+  NAME = c("Waianae", "Maili", "Nanakuli", "Makaha",
+           "Kapolei", "Ewa Beach", "Ewa Gentry", "Makakilo",
+           "Mililani Town", "Wahiawa", "Waipahu", "Pearl City", "Aiea",
+           "Urban Honolulu", "East Honolulu",
+           "Kailua", "Kaneohe", "Waimanalo",
+           "Laie", "Haleiwa", "Waialua", "Kahuku"),
+  region = c(rep("Leeward", 4), rep("Ewa", 4), rep("Central", 5),
+             rep("Honolulu", 2), rep("Windward", 3), rep("North Shore", 4))
+)
+
+place_change <- extract_mean(percent_storm1, "pct_storm1") |>
+  left_join(extract_mean(percent_storm2, "pct_storm2"), by = "NAME") |>
+  left_join(extract_mean(z_score_storm1, "z_storm1"), by = "NAME") |>
+  left_join(extract_mean(z_score_storm2, "z_storm2"), by = "NAME") |>
+  left_join(region_lookup, by = "NAME") |>
+  mutate(z_diff = z_storm1 - z_storm2)
+
+place_change |>
+  filter(!is.na(z_storm1)) |>
+  arrange(z_storm1) |>
+  select(NAME, region, pct_storm1, pct_storm2, z_storm1, z_storm2, z_diff)
+```
+
+```{r}
+place_change |>
+  filter(!is.na(z_storm1)) |>
+  select(NAME, `Storm 1` = z_storm1, `Storm 2` = z_storm2) |>
+  pivot_longer(c(`Storm 1`, `Storm 2`), names_to = "storm", values_to = "z") |>
+  ggplot(aes(x = reorder(NAME, z), y = z, fill = storm)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, color = "grey30") +
+  coord_flip() +
+  scale_fill_manual(values = c("Storm 1" = "steelblue", "Storm 2" = "maroon")) +
+  labs(title = "Which Kona Low Hit Which Community Harder",
+       x = NULL, y = "Mean z-score", fill = NULL) +
+  theme_minimal()
+```
+
+At the community level, Mililani Town, Ahuimanu, Wheeler Air Force Base, Waimanalo and Kaneohe show the largest darkening under Storm 1, though all of these are small in absolute terms. Kailua, Haleiwa and Waimanalo Beach show the largest percent losses under Storm 2, in the range of 16 to 26 percent.
+
+## Answering the research question
+
+Everything up to this point has produced maps and tables. Reading a research finding off a map is a judgment call, and two people looking at the same raster can reach different conclusions. This section exists to remove that ambiguity by reducing the analysis to specific numbers that either support the claim or do not.
+
+```{r}
+zv1 <- values(z_score_storm1); zv2 <- values(z_score_storm2)
+zvg <- values(z_score_gap)
+
+mean_z_s1  <- mean(zv1[is.finite(zv1)], na.rm = TRUE)
+mean_z_s2  <- mean(zv2[is.finite(zv2)], na.rm = TRUE)
+mean_z_gap <- mean(zvg[is.finite(zvg)], na.rm = TRUE)
+
+pv1 <- values(percent_storm1); pv2 <- values(percent_storm2)
+mean_p_s1 <- mean(pv1[is.finite(pv1)], na.rm = TRUE)
+mean_p_s2 <- mean(pv2[is.finite(pv2)], na.rm = TRUE)
+
+worse_storm  <- if (mean_z_s1 < mean_z_s2) "the first storm" else "the second storm"
+agree_metric <- if ((mean_z_s1 < mean_z_s2) == (mean_p_s1 < mean_p_s2)) "agree" else "disagree"
+
+region_summary <- place_change |>
+  filter(!is.na(region), !is.na(z_storm1)) |>
+  group_by(region) |>
+  summarize(z_storm1 = mean(z_storm1, na.rm = TRUE),
+            z_storm2 = mean(z_storm2, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(z_diff = z_storm1 - z_storm2)
+
+worst_s1_region <- region_summary$region[which.min(region_summary$z_storm1)]
+worst_s2_region <- region_summary$region[which.min(region_summary$z_storm2)]
+biggest_split   <- region_summary$region[which.max(abs(region_summary$z_diff))]
+
+region_summary
+```
+
+This first chunk takes the rasters built earlier and reduces each to a single islandwide number. It averages the z score and percent change values for both storms and for the gap night, filtering out non finite values first, since a handful of pixels with near zero baseline variability produce infinite z scores that would otherwise turn every average into nan. It then compares the two storms and stores the result as worse_storm, and checks whether percent change ranks them the same way as the z score, storing that as agree metric. then it collapses the community table into island regions and identifies which region each storm hit hardest and where the two diverged most.
+
+```{r}
+sapply(list(z1 = z_score_storm1, z2 = z_score_storm2),
+       function(r) sum(is.infinite(values(r))))
+
+quantile(values(baseline_sd), 0.1, na.rm = TRUE)
+```
+
+```{r}
+region_summary |>
+  select(region, `Storm 1` = z_storm1, `Storm 2` = z_storm2) |>
+  pivot_longer(c(`Storm 1`, `Storm 2`), names_to = "storm", values_to = "z") |>
+  ggplot(aes(x = reorder(region, z), y = z, fill = storm)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, color = "grey30") +
+  coord_flip() +
+  scale_fill_manual(values = c("Storm 1" = "steelblue", "Storm 2" = "maroon")) +
+  labs(title = "Which Storm Hit Which Region Harder",
+       x = NULL, y = "Mean z-score", fill = NULL) +
+  theme_minimal()
+```
+
+Then I plot that regional summary as a grouped bar chart, so the numbers behind the regional claim are visible rather than only textual.
+
+## conclusion
+
+The two Kona low storms did not effect Oahu equally. The second storm, from march 19 to 24, produced a clearer loss of nighttime light across the island. The first storm, march 10 to 16, produced no detectable darkening..
+
+The regional pattern is where storm difference becomes the clearest. Storm 2 is concentrated on thr windward side, while ewa and leeward stayed nearest their baseline/ Storm 1 didnt show a comparable structure. Between the 2 storms, north shore diverged the most, followed by windward. Because these are dimly lit and normally stable areas, a larger z score reflected a unsual anomaly for these places, rather than absolute loss of light. despite holding most of the islands population, Honolulu did not see the same loss.
+
+Limitations: VIIRS passes over once per night at roughly 1 to 2 AM, so an outage that began and was restored between overpasses leaves no trace. The March 18 gap night rests on that single overpass rather than a multi night average and came back unexplainably dark, so it should be treated as inconclusive rather than used as evidence. ALso, EAGLE I outage records are not yet published for 2026, so none of these findings is checked against reported customer counts.
+
+```{r}
+
+```
