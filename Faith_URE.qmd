@@ -1,0 +1,72 @@
+---
+title: "Faith_URE"
+format: html
+editor: visual
+---
+
+## Kona Low analysis for paper
+
+```{r}
+library(blackmarbler)
+library(sf)
+library(terra)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tidyterra)
+library(lubridate)
+library(tigris)
+library(exactextractr)
+
+options(tigris_use_cache = TRUE)
+
+bearer <- Sys.getenv("NASA_BEARER")
+```
+
+### Dates 
+
+```{r}
+all_dates <- list(
+  baseline = seq.Date(from = ymd("2025-05-01"), to = ymd("2025-08-03"), by = "day"),
+  storm1   = seq.Date(from = ymd("2026-03-10"), to = ymd("2026-03-16"), by = "day"),
+  gap      = ymd("2026-03-18"),
+  storm2   = seq.Date(from = ymd("2026-03-19"), to = ymd("2026-03-24"), by = "day")
+)
+```
+
+### pulling dates 
+
+```{r}
+#r_list <- list()
+
+#for (period in names(all_dates)) {
+ # dates <- all_dates[[period]]
+
+  #lst <- lapply(dates, function(d) {
+   # tryCatch(#try catch skips missing values
+    #  bm_raster(roi_sf = roi_sf,
+                product_id = "VNP46A2",
+                quality_flag_rm = 2,
+                date = d,
+                bearer = bearer),
+      error = function(e) {
+        message("No imagery for ", d)
+        NULL
+      }
+    )
+  })
+
+  names(lst) <- as.character(dates)
+  lst <- lst[!sapply(lst, is.null)]
+
+  r <- rast(lst)
+  names(r) <- names(lst)
+  r_list[[period]] <- r
+}
+
+data.frame(
+  period    = names(all_dates),
+  requested = sapply(all_dates, length),
+  retrieved = sapply(r_list, nlyr)
+)
+```
