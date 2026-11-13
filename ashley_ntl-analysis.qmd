@@ -1,0 +1,544 @@
+---
+title: "ashley_ntl-analysis"
+format: html
+editor_options:
+  chunk_output_type: console
+---
+
+## Kona Low Nighttime Light Analysis
+
+The first Kona low storm of 2026 hit Hawaii from **March 10 through March 16**, and the second Kona low storm arrived from **March 19 to March 24**. Kona lows are a type of subtropical storm system that tends to form during the winter and early spring months in Hawaii. Unlike a typical hurricane, they do not always bring one clean hit. Instead they can linger over the islands for several days, bringing bands of heavy rain, strong wind gusts, and even lightning as the system passes through.
+
+**Research Question:** How did the first Kona Low storm and second Kona Low storm differ in their impact on power outages on Oahu?
+
+1.  Regionally, how did the impacts differ?
+2.  Did outage patterns correlate with the storm's path? (E.g., Are areas with higher amounts of rainfall correlated with power outages?)
+
+To explore our questions, we will be using NASA's Black Marble nighttime lights to observe and detect power outages.
+
+### Libraries
+
+```{r}
+library(blackmarbler)
+library(geodata)
+library(terra)
+library(sf)
+library(tidyterra)
+library(tigris)
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+```
+
+```{r}
+bearer <- get_nasa_token(username = Sys.getenv("NASA_USER"), 
+                         password = Sys.getenv("NASA_PASS"))
+```
+
+### Create Directory to Save Visualizations
+
+```{r}
+vol <- '/media/volume/aalfaro-NTL-data'
+fig_dir <- file.path(vol, 'figures')
+
+# dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+### Read in ROI
+
+We pulled the polygon for the state of Hawaii into our volume, so we are unwrapping it so that it can be used. Since we are only analyzing islands who are under HECO (Hawaii County, Honolulu County, and Maui County), we had to narrow the region of interest down even further. We also want to focus our analysis on Oahu, since that is where we are from and it is HECO's largest customer base.
+
+```{r}
+islands <- readRDS("/media/volume/aalfaro-NTL-data/gadm/gadm41_USA_1_pk.rds") |>
+  unwrap() |> st_as_sf() |> subset(NAME_1 == "Hawaii") |> st_cast("POLYGON")
+cent <- st_coordinates(st_centroid(st_geometry(islands)))
+
+roi_state <- islands[cent[, 1] > -158.8, ]  # HECO islands
+roi_oahu  <- islands[cent[, 1] > -158.4 & cent[, 1] < -157.6 &
+                     cent[, 2] > 21.2   & cent[, 2] < 21.8, ]
+```
+
+#### Pulling Oahu Places
+
+```{r}
+oahu_boundary <- counties(state = 'HI', cb = TRUE) %>%   
+  filter(COUNTYFP == '003')
+
+hawaii_places <- places(state = 'HI', cb = TRUE)  
+oahu_places <- st_filter(hawaii_places, oahu_boundary)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = oahu_places, fill = NA, color = "black", linewidth = 0.3) +
+  theme_void()
+```
+
+### Read in Baseline Data
+
+The baseline dates are 90-days total. It ranges from **May 1 - Aug 3, 2025**. This is to account for nighttime light
+
+```{r}
+ntl_dir <- "/media/volume/aalfaro-NTL-data/ntl_baseline"
+files <- list.files(ntl_dir, pattern = "\\.tif$", full.names = TRUE)
+ntl <- rast(files)
+
+names(ntl) <- sub(".*t(\\d{4})_(\\d{2})_(\\d{2})\\.tif$", "\\1-\\2-\\3", files)
+```
+
+### Pull Storm and Test Dates
+
+**Kona 1:** March 10-13, 2026 \| **Kona 2:** March 19-24, 2026
+
+The test dates are to see if power outages are actually being detected when compared to the baseline period, or if it is possibly just fluctuating nighttime light radiance. The test date ranges were determined by looking at cloud coverage on [NASA's LAADS](https://ladsweb.modaps.eosdis.nasa.gov/view-data/#l:VIIRS_SNPP_DayNightBand_At_Sensor_Radiance;@-151.3,18.7,5.4z) Black Marble Level-1 NTL archive and looking at the HCDP to observe rainfall. I specifically chose days with little cloud coverage and little rainfall.
+
+```{r}
+period_dates <- list(
+  test1 = seq.Date(from = ymd("2026-02-25"), to = ymd("2026-02-28"), by = "day"),
+  test2 = seq.Date(from = ymd("2026-05-10"), to = ymd("2026-05-13"), by = "day"),
+  storm1 = seq.Date(from = ymd("2026-03-10"), to = ymd("2026-03-16"), by = "day"),
+  storm2 = seq.Date(from = ymd("2026-03-19"), to = ymd("2026-03-24"), by = "day")
+)
+```
+
+```{r}
+storm_dir <- "/media/volume/aalfaro-NTL-data/ntl_storms"
+# dir.create(storm_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r, eval = FALSE}
+for (period in names(period_dates)) {
+  dir.create(file.path(storm_dir, period), recursive = TRUE, showWarnings = FALSE)
+
+  bm_raster(roi_sf = roi_state,
+            product_id = "VNP46A2",
+            quality_flag_rm = 2,
+            date = period_dates[[period]],
+            bearer = bearer,
+            output_location_type = "file",
+            file_dir = file.path(storm_dir, period),
+            h5_dir = tempdir(),
+            file_skip_if_exists = TRUE)
+}
+```
+
+```{r}
+r_list <- lapply(names(period_dates), \(p) {
+  f <- list.files(file.path(storm_dir, p), pattern = "\\.tif$", full.names = TRUE)
+  r <- rast(f)
+  names(r) <- sub(".*t(\\d{4})_(\\d{2})_(\\d{2})\\.tif$", "\\1-\\2-\\3", f)
+  r
+}) |> setNames(names(period_dates))
+```
+
+### Baseline: Masking ROI
+
+```{r}
+# Crop to the ROI, mask to its shape, average days, log transform
+oahu_places <- oahu_places |> st_transform(4326)
+
+make_baseline <- function(ntl, roi) {
+  v <- vect(roi)
+  v <- project(v, crs(ntl))
+  ntl |> crop(v) |> mask(v) |> mean(na.rm = TRUE) |> (\(r) log(r + 1))()
+}
+
+baseline_state <- make_baseline(ntl, roi_state)
+baseline_oahu  <- make_baseline(ntl, oahu_places)
+```
+
+#### Map Baseline Radiance
+
+```{r}
+plot_ntl <- function(r, title) {
+  ggplot() +
+    geom_spatraster(data = r) +
+    scale_fill_gradient2(low = "black", mid = "yellow", high = "red",
+                         midpoint = 4.5, na.value = "transparent") +
+    labs(title = title, subtitle = "May 1 - Aug 3, 2025") +
+    coord_sf() +
+    theme_void() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5))
+}
+
+plot_ntl(baseline_oahu,  "Oahu Nighttime Lights: 90-Day Baseline")
+plot_ntl(baseline_state, "Hawaii Nighttime Lights: 90-Day Baseline")
+```
+
+### Mapping Kona Low NTL
+
+I will mask the island to include neighborhood and cities for our nighttime light analysis. This is to ensure that rural areas that may have low radiance levels aren't excluded in the analysis, especially since I will drop pixels that have a radiance level less than 3.
+
+```{r}
+v_oahu_places <- oahu_places |> vect()
+v_oahu <- vect(roi_oahu)
+
+# Raw baseline mean for every pixel on the island (places or not)
+base_raw <- ntl |> mean(na.rm = TRUE) |> crop(v_oahu) |> mask(v_oahu)
+
+# Share of island pixels kept at each raw value
+# sapply(c(0.5, 1, 2, 3, 4, 5), \(f) global(base_raw >= f, "mean", na.rm = TRUE)[[1]]) 
+# Output: 0.7576451 0.5427402 0.4512401 0.3725018 0.3198892 0.2829280
+hist(values(base_raw), breaks = 100)
+```
+
+The histogram shows that NTL radiance is heavily right-skewed, meaning that majority of the pixels have 0 radiance captured. It would be best to remove those pixels to avoid giving false results of extreme increases/decreases of pixel radiance.
+
+```{r}
+NOISE_FLOOR <- 3
+
+in_places <- !is.na(mask(base_raw, v_oahu_places)) # TRUE inside Oahu places
+bright <- base_raw >= NOISE_FLOOR   # TRUE where baseline is bright enough
+bright[is.na(bright)] <- FALSE
+
+keep_mask <- bright & (in_places | !is.na(base_raw)) # one combined mask
+
+prep <- function(r) r |> crop(v_oahu) |> mask(keep_mask, maskvalues = FALSE)
+
+r_raw <- lapply(c(r_list, list(baseline = ntl)), prep)
+r_masked_places <- lapply(r_raw, \(r) log(r + 1))
+
+places_outline <- ifel(keep_mask, 1, NA) |> 
+  as.polygons(dissolve = TRUE) |> 
+  st_as_sf()
+```
+
+```{r}
+# Map: one panel per day, March 10-16, 2026
+ggplot() +
+  geom_spatraster(data = r_masked_places$storm1) +
+  facet_wrap(~lyr, ncol = 2) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  
+  labs(title = "Oahu Nighttime Lights: March 10-16, 2026",
+       subtitle = "First Kona Low Storm of 2026 \n(Missing Mar 10-12)",
+       caption = "Note: This is masked to only include neighborhoods and cities on Oahu to more accurately observe nighttime light radiance.") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+```{r}
+# Map: one panel per day, March 19-24, 2026
+ggplot() +
+  geom_spatraster(data = r_masked_places$storm2) +
+  facet_wrap(~lyr, ncol = 3) +
+  scale_fill_gradient2(low = "black",
+                       mid = "yellow",
+                       high = "red",
+                       midpoint = 4.5,
+                       na.value = "transparent") +
+  
+  labs(title = "Oahu Nighttime Lights: March 19-24, 2026",
+       subtitle = "Second Kona Low Storm of 2026",
+       caption = "Note: This is masked to only include neighborhoods and cities on Oahu to more accurately observe nighttime light radiance.") +
+  coord_sf() +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        strip.text = element_text(face = "bold"),
+        legend.position = "none")
+```
+
+### Prep Metric Scores
+
+```{r}
+# Mean raster per period + change rasters
+period_mean <- lapply(r_masked_places, mean, na.rm = TRUE)
+
+# Raw means, used for percent change only
+raw_mean <- lapply(r_raw, mean, na.rm = TRUE)
+raw_mean$baseline[raw_mean$baseline == 0] <- NA # avoid dividing by zero
+
+# Absolute Change
+absolute_storm1 <- raw_mean$storm1 - raw_mean$baseline
+absolute_storm2 <- raw_mean$storm2 - raw_mean$baseline
+
+# Percent Change (averaged)
+percent_storm1 <- (raw_mean$storm1 - raw_mean$baseline) / raw_mean$baseline * 100
+percent_storm2 <- (raw_mean$storm2 - raw_mean$baseline) / raw_mean$baseline * 100
+# Percent Change (nightly)
+percent_storm1_nightly <- (r_raw$storm1 - raw_mean$baseline) / raw_mean$baseline * 100
+percent_storm2_nightly <- (r_raw$storm2 - raw_mean$baseline) / raw_mean$baseline * 100
+
+base_sd <- stdev(r_masked_places$baseline, na.rm = TRUE)
+
+# Drop pixels where the SD is meaningless
+n_valid <- sum(!is.na(r_masked_places$baseline))  
+base_sd[base_sd == 0 | n_valid < 30] <- NA
+
+# Z-Scores (averaged)
+z_storm1 <- (period_mean$storm1 - period_mean$baseline) / base_sd
+z_storm2 <- (period_mean$storm2 - period_mean$baseline) / base_sd
+z_normal <- (period_mean$test1 - period_mean$baseline) / base_sd
+z_normal2 <- (period_mean$test2 - period_mean$baseline) / base_sd
+# Z-Scores (nightly)
+z_storm1_nightly <- (r_masked_places$storm1 - period_mean$baseline) / base_sd
+z_storm2_nightly <- (r_masked_places$storm2 - period_mean$baseline) / base_sd
+z_normal_nightly <- (r_masked_places$test1 - period_mean$baseline) / base_sd
+z_normal2_nightly <- (r_masked_places$test2 - period_mean$baseline) / base_sd
+```
+
+```{r}
+plot_ntl_metric <- function(r, title = NULL, subtitle = NULL, caption = NULL,
+                            fill = NULL, ncol = NULL, file = NULL) {
+
+  p <- ggplot() +
+    geom_spatvector(data = roi_oahu, fill = "white", color = "gray45", linewidth = 0.6) +
+    geom_spatraster(data = r) +
+    geom_spatvector(data = places_outline, fill = NA, color = "gray45", linewidth = 0.4) +
+    ntl_scale_gradient +
+    labs(title = title, subtitle = subtitle, caption = caption, fill = fill) +
+    coord_sf() +
+    theme_void() +
+    theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 6)),
+          plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 12)),
+          plot.caption = element_text(size = 9, hjust = 0.5, margin = margin(t = 12)),
+          strip.text = element_text(size = 12),
+          plot.margin = margin(20, 20, 20, 20),
+          legend.margin = margin(0, 0, 0, 10))
+
+  if (!is.null(ncol)) p <- p + facet_wrap(~lyr, ncol = ncol)
+
+  if (!is.null(file)) {
+    w <- if (is.null(ncol)) 10 else 5 * ncol  # wider for more columns
+    h <- if (is.null(ncol)) 8 else 4 * ceiling(nlyr(r) / ncol) + 1  # taller for more rows
+    ggsave(file.path(fig_dir, paste0(file, ".png")), p,
+           width = w, height = h, dpi = 200, bg = "white")
+  }
+  p
+}
+
+ntl_scale_gradient <- scale_fill_gradient2(
+  low = "black", mid = "white", high = "gold1",
+  midpoint = 0, na.value = "transparent")
+```
+
+### Absolute Change
+
+Absolute change helps to answer this question: How much raw light was lost at this exact spot? The main caveat is that lower light emitting areas may not show as much compared to stronger light emitting areas.
+
+#### Storm 1
+
+```{r}
+plot_ntl_metric(absolute_storm1,
+                title = "Nighttime Light Absolute Change: First Kona Low",
+                subtitle = "Average of storm nights, Mar 13-16, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                fill = "Absolute Change")
+```
+
+#### Storm 2
+
+```{r}
+plot_ntl_metric(absolute_storm2,
+                title = "Nighttime Light Absolute Change: Second Kona Low",
+                subtitle = "Average of storm nights, Mar 13-16, 2026 vs. May 1 - Aug 3, 2025 \nSatellite imagery taken ~1:30 AM local time.",
+                fill = "Absolute Change")
+```
+
+### Percent Change
+
+Percent change looks at what share of a pixel's normal light was lost.
+
+#### Storm 1
+
+```{r}
+plot_ntl_metric(percent_storm1,
+                title    = "Nighttime Light Percent Change: First Kona Low",
+                subtitle = "Average of storm nights, Mar 13-16, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption  = "Percent change = (storm radiance - baseline radiance) / baseline radiance x 100, calculated per pixel.\nNegative values (gray) show the share of a pixel's normal light that was lost; -100% means the pixel went completely dark.",
+                fill = "Percent Change",
+                file = "percent_storm1")
+```
+
+```{r}
+plot_ntl_metric(percent_storm1_nightly,
+             title = "Nightly Nighttime Percent Change: First Kona Low",
+             subtitle = "Each night, Mar 13-16, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+             caption = "Percent change = (storm-night radiance - baseline radiance) / baseline radiance x 100, calculated per pixel.\nNegative values (gray) show the share of a pixel's normal light that was lost.",
+             fill = "Percent Change",
+             ncol  = 2,
+             file = "percent_storm1_nightly")
+```
+
+#### Storm 2
+
+```{r}
+plot_ntl_metric(percent_storm2,
+                title = "Nighttime Light Percent Change: Second Kona Low",
+                subtitle = "Average of storm nights, Mar 19-24, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Percent change = (storm radiance - baseline radiance) / baseline radiance x 100, calculated per pixel.\nNegative values (gray) show the share of a pixel's normal light that was lost; -100% means the pixel went completely dark.",
+                fill = "Percent Change",
+                file = "percent_storm2")
+```
+
+```{r}
+plot_ntl_metric(percent_storm2_nightly,
+                title = "Nightly Nighttime Light Percent Change: Second Kona Low",
+                subtitle = "Each night, March 19-24, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Percent change = (storm-night radiance - baseline radiance) / baseline radiance x 100, calculated per pixel.\nNegative values (gray) show the share of a pixel's normal light that was lost.",
+                fill = "Percent Change",
+                ncol  = 3,
+                file = "percent_storm2_nightly")
+```
+
+The share of lost light per pixel seems to appear in the same areas for Kona 1 and Kona 2. However, the share of lost light is greater for Kona 2 compared to Kona 1. This suggests there was less light captured on the nighttime light satellite imagery throughout Kona 2. It is important to keep in mind while interpreting the results that rural areas, such as Waialua, were included and are more sensitive to fluctuating radiance. The lost of light could also be due to cloud coverage. That said, percent change makes it hard to say for certain if Kona 2 had stronger impacts on the island than Kona 1.
+
+### Z-Scores
+
+Z-Scores helps answer: How unusual is this storm-night value, given how much this specific pixel normally fluctuates? In other words, it accounts for the variability in the pixel level since nighttime light radiance can vary due to a multitude of reasons, such as cloud covering, seasonal changes, etc.
+
+#### Storm 1
+
+```{r}
+plot_ntl_metric(z_storm1,
+                title = "Nighttime Light Z-Scores: First Kona Low",
+                subtitle = "Average of storm nights, Mar 13-16, 2026, vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Z-score = (storm radiance - baseline mean) / baseline standard deviation, calculated per pixel on log radiance.\nNegative values (dark) mean a pixel was dimmer than usual for that location; values near 0 (white) mean typical conditions.",
+                fill = "Z-Score",
+                file = "z_storm1")
+```
+
+```{r}
+plot_ntl_metric(z_storm1_nightly,
+                title = "Nightly Nighttime Light Z-Scores: First Kona Low",
+                subtitle = "Each night, Mar 13-16, 2026, vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Z-score = (storm-night radiance - baseline mean) / baseline standard deviation, calculated per pixel on log radiance.\nNegative values (dark) mean a pixel was dimmer than usual for that location; values near 0 (white) mean typical conditions.",
+                fill = "Z-Score",
+                ncol = 2,
+                file = "z_storm1_nightly")
+```
+
+The z-scores indicate there doesn't appear to be any large clusters of areas that have severe unusual dimming for NTL radiance.
+
+#### Storm 2
+
+```{r}
+plot_ntl_metric(z_storm2,
+                title = "Nighttime Light Z-Scores: Second Kona Low",
+                subtitle = "Average of storm nights, Mar 19-24, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Z-score = (storm radiance - baseline mean) / baseline standard deviation, calculated per pixel on log radiance.\nNegative values (dark) mean a pixel was dimmer than usual for that location; values near 0 (white) mean typical conditions.",
+                fill = "Z-Scores",
+                file = "z_storm2")
+```
+
+```{r}
+plot_ntl_metric(z_storm2_nightly,
+                title = "Nightly Nighttime Light Z-Scores: Second Kona Low",
+                subtitle = "Each night, Mar 19-24, 2026 vs. baseline of May 1 - Aug 3, 2025 \nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Z-score = (storm-night radiance - baseline mean) / baseline standard deviation, calculated per pixel on log radiance.\nNegative values (dark) mean a pixel was dimmer than usual for that location; values near 0 (white) mean typical conditions.",
+                fill = "Z-Scores",
+                ncol = 3,
+                file = "z_storm2_nightly")
+```
+
+Notably, there are pixels in the second Kona low that have z-scores of -10, which indicates that it is a lot dimmer than it usually is. Due to the wide scale, it makes the pixels that also have negative z-scores appear not as severe. Interestingly, there are darker pixels for March 21, 2026 in Hawaii Kai, Kailua, and North Shore area. When I looked up articles regarding Oahu power outages during this time, this [KHON2 article](https://www.khon2.com/local-news/heco-cut-power-thousands-flood-conditions/) written on March 20, 2026 said "about 4,200 customers in the North Shore will remain without power overnight due to the mandatory flood evacuation orders preventing workers from restoring power," so that may have been what was captured in the satellite imagery for March 21, 2026.
+
+### Baseline vs. Control Days
+
+```{r}
+plot_ntl_metric(z_normal_nightly,
+                title = "Nightly Nighttime Light Z-Scores: Non-Storm Control",
+                subtitle = "Each night, Feb 25-28, 2026 vs. baseline of May 1 - Aug 3, 2025\nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Clear, low-rainfall nights with no storm, used to check how much radiance normally fluctuates.\nZ-score = (night radiance - baseline mean) / baseline standard deviation, per pixel on log radiance. Values near 0 (white) mean typical variation.",
+                fill = "Z-Score",
+                ncol = 2,
+                file = "z_control_feb")
+```
+
+```{r}
+plot_ntl_metric(z_normal2_nightly,
+                title  = "Nightly Nighttime Light Z-Scores: Non-Storm Control",
+                subtitle = "Each night, May 10-13, 2026 vs. baseline of May 1 - Aug 3, 2025\nSatellite imagery taken at ~1:30 AM local time.",
+                caption = "Clear, low-rainfall nights with no storm, used to check how much radiance normally fluctuates.\nZ-score = (night radiance - baseline mean) / baseline standard deviation, per pixel on log radiance. Values near 0 (white) mean typical variation.",
+                fill = "Z-Score",
+                ncol = 2,
+                file = "z_control_may")
+```
+
+### Assessing Storm Impacts
+
+To answer sub-question 1, I will be looking at the average z-scores across the different regions on Oahu per storm. In order to do that, I have to group the places by region, then retrieve the z-scores per region and average them. The regions will be Waianae Coast, Ewa / Kapolei, Central, Pearl Harbor
+
+```{r}
+regions <- list(
+  "Leeward"     = c("Nanakuli", "Maili", "Waianae", "Makaha", "Makaha Valley"),
+  "Ewa"         = c("Ewa Villages", "Ewa Beach", "Ewa Gentry", "East Kapolei", "Kapolei", "Makakilo",
+                    "Ko Olina", "Kalaeloa", "Ocean Pointe", "West Loch Estate", "Iroquois Point"),
+  "Central"     = c("Mililani Town", "Mililani Mauka", "Waipio Acres", "Waipio", "Wahiawa", "Whitmore Village",
+                    "Schofield Barracks", "Wheeler AFB", "Helemano", "Royal Kunia", "Waikele", "Waipahu"),
+  "Honolulu"    = c("Urban Honolulu", "East Honolulu",
+                    "Pearl City", "Aiea", "Waimalu", "Halawa", "Hickam Housing"),
+  "Windward"    = c("Kailua", "Kaneohe", "Kaneohe Base", "Kahaluu", "Heeia", "Ahuimanu", "Maunawili",
+                    "Waimanalo", "Waimanalo Beach", "Waiahole-Waikane"),
+  "North Shore" = c("Haleiwa", "Waialua", "Mokuleia", "Pupukea", "Kawela Bay", "Kahuku",
+                    "Laie", "Hauula", "Punaluu", "Kaaawa")
+)
+
+oahu_places$region <- setNames(rep(names(regions), lengths(regions)), unlist(regions))[oahu_places$NAME]
+regions_v <- aggregate(vect(oahu_places), by = "region")
+```
+
+```{r}
+# Mean z-score per region for each storm
+z_region <- c(z_storm1, z_storm2) |> setNames(c("First Kona Low", "Second Kona Low")) |>
+  terra::extract(regions_v, fun = mean, na.rm = TRUE) |>
+  mutate(region = regions_v$region) |>
+  select(-ID) |>
+  pivot_longer(-region, names_to = "storm", values_to = "z")
+
+ggplot(z_region, aes(z, reorder(region, z), fill = storm)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_vline(xintercept = 0, color = "gray30") +
+  scale_fill_manual(values = c("First Kona Low" = "steelblue", "Second Kona Low" = "maroon")) +
+  labs(title = "Which Storm Hit Which Region Harder?",
+       subtitle = "Mean Nighttime Light Z-Score by Region",
+       x = "Mean Z-Score", y = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(t = 6, b = 6)),
+        plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 12)),
+        legend.position = "bottom")
+
+ggsave(file.path(fig_dir, "z_region_bar.png"), width = 8, height = 6, dpi = 200, bg = "white")
+```
+
+While negative z-scores are not a definitive indicator of power outages, it shows that for all regions, except Leeward, Kona low 2 had more pixels/areas that were unusually dimmer compared to Kona low 1. This could suggest that second Kona low storm had stronger impacts than the first Kona Low storm. However, it is also hard to gauge whether the impacts from the first Kona low are bleeding over into the second Kona low.
+
+```{r}
+metrics <- list(
+  "Percent change (%)" = c(percent_storm1, percent_storm2),
+  "Z-score (log scale)" = c(z_storm1, z_storm2)
+)
+
+pixel_df <- lapply(names(metrics), \(m) {
+  v <- as.data.frame(values(metrics[[m]]))
+  names(v) <- c("First Kona Low", "Second Kona Low")
+  pivot_longer(v, everything(), names_to = "storm") |> mutate(metric = m)
+}) |> bind_rows() |> filter(is.finite(value))
+
+ggplot(pixel_df, aes(value, fill = storm)) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
+  geom_vline(xintercept = 0, color = "gray30") +
+  facet_wrap(~metric, scales = "free", ncol = 1) +
+  scale_fill_manual(values = c("First Kona Low" = "steelblue", "Second Kona Low" = "maroon")) +
+  labs(title = "Distribution of Averaged Pixel Changes vs. Baseline",
+       x = NULL, y = "Number of Pixels", fill = NULL) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "bottom")
+```
+
+### Limitations
+
+-   The satellite imagery for the nighttime lights (NTLs) are captured at around 1:30 AM local time. It is unable to capture any power outages that were restored prior to when the satellite imagery was taken. That said, NTLs may be more useful in detecting long-term power outages.
+-   There is missing satellite imagery for March 10-12, 2026 for the first Kona low storm. That is three days worth of data that we are unable to include in our analysis.
+-   For the 90-day baseline, there was missing satellite imagery for July 5-7, 2025, and there was a missing .h5 file for July 4,2025, which needed to be removed. So, in order to reach 90-days, we had to extend the date range to be from May 1-Aug 3, 2025.
+-   We have no ground-truth data. So, we are unable to verify if our findings with NASA's Black Marble NTLs are accurate and actually detecting power outages. In the future, we may verify if NTLs are reliable to use for power outages with a storm that happened prior to 2026 and use EAGLE-I data to verify those findings.
