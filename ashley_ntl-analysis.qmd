@@ -513,28 +513,49 @@ ggsave(file.path(fig_dir, "z_region_bar.png"), width = 8, height = 6, dpi = 200,
 While negative z-scores are not a definitive indicator of power outages, it shows that for all regions, except Leeward, Kona low 2 had more pixels/areas that were unusually dimmer compared to Kona low 1. This could suggest that second Kona low storm had stronger impacts than the first Kona Low storm. However, it is also hard to gauge whether the impacts from the first Kona low are bleeding over into the second Kona low.
 
 ```{r}
-metrics <- list(
-  "Percent change (%)" = c(percent_storm1, percent_storm2),
-  "Z-score (log scale)" = c(z_storm1, z_storm2)
-)
+z_pixels <- c(z_storm1, z_storm2) |> setNames(c("First Kona Low", "Second Kona Low")) |>
+  terra::extract(vect(oahu_places)) |>
+  mutate(place = oahu_places$NAME[ID], region = oahu_places$region[ID]) |>
+  pivot_longer(c("First Kona Low", "Second Kona Low"), names_to = "storm", values_to = "z") |>
+  filter(!is.na(z))
 
-pixel_df <- lapply(names(metrics), \(m) {
-  v <- as.data.frame(values(metrics[[m]]))
-  names(v) <- c("First Kona Low", "Second Kona Low")
-  pivot_longer(v, everything(), names_to = "storm") |> mutate(metric = m)
-}) |> bind_rows() |> filter(is.finite(value))
-
-ggplot(pixel_df, aes(value, fill = storm)) +
-  geom_histogram(bins = 100, position = "identity", alpha = 0.6) +
-  geom_vline(xintercept = 0, color = "gray30") +
-  facet_wrap(~metric, scales = "free", ncol = 1) +
-  scale_fill_manual(values = c("First Kona Low" = "steelblue", "Second Kona Low" = "maroon")) +
-  labs(title = "Distribution of Averaged Pixel Changes vs. Baseline",
-       x = NULL, y = "Number of Pixels", fill = NULL) +
-  theme_minimal() +
-  theme(plot.title = element_text(face = "bold", hjust = 0.5),
-        legend.position = "bottom")
+# Regional table
+z_pixels |>
+  group_by(region, storm) |>
+  summarise(n_pixels = n(), mean_z = mean(z), median_z = median(z),
+            pct_below_2 = mean(z < -2) * 100, .groups = "drop") |>
+  arrange(region, storm)
 ```
+
+North Shore has the least amount of pixels (n = 66), while Honolulu has the most pixels (n = 1090). This is important to keep in mind when interpreting the mean z-scores, as smaller sample sizes could produce less reliable averages and are more sensitive to outliers. 
+
+The table supports what the diverging bar chart shows that the second Kona low storm hit every region harder compared to the first Kona low storm. Windward (n = 308) is the only region with substantial severe light loss (pct_below_2) in both storms, nearly doubling from 0.974% (~3 pixels) in the first storm and 1.95% (~6 pixels) in the second storm. North Shore had the sharpest overall decline in typical brightness during the second storm (median_z of -0.567, mean_z of -0.416). However, pct_below_2 stayed at 0%, meaning the dimming was likely widespread and moderate across the region rather than concentrated in extreme blackouts.
+
+```{r}
+c(z_storm1_nightly, z_storm2_nightly) |>
+  terra::extract(regions_v, fun = mean, na.rm = TRUE) |>
+  mutate(region = regions_v$region) |> select(-ID) |>
+  pivot_longer(-region, names_to = "night", values_to = "z") |>
+  ggplot(aes(night, region, fill = z)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", z),
+                color = z < -1), size = 3.5) +
+  scale_fill_gradient2(low = "black", mid = "white", high = "gold1", midpoint = 0) +
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black"), guide = "none") +
+  labs(title = "Mean Z-Score by Region and Night",
+       subtitle = "Averaged across pixels within each region",
+       caption = "Negative values mean regions were dimmer than usual; values near 0 mean typical conditions.",
+       x = NULL, y = NULL, fill = "Z-Score") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 6)),
+        plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 12)),
+        plot.caption = element_text(size = 9, hjust = 0.5, margin = margin(t = 12)),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(fig_dir, "z_region_night_heatmap.png"), width = 10, height = 7, dpi = 200, bg = "white")
+```
+
+The heatmap shows that Windward and North Shore consistently had negative mean z-scores across all storm nights, with the most substantial light loss occurring on March 21, 2026 for both regions. Interestingly, all regions had a negative mean z-score for March 24, 2026, but it is difficult to say for certain that all areas had clusters of power outages, since other factors (e.g., cloud coverage) could being causing the nighttime lights to appear dimmer than usual. 
 
 ### Limitations
 
