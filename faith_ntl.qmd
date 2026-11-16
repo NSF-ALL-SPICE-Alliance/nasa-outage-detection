@@ -1,0 +1,261 @@
+---
+title: "faith_ntl_analysis"
+format: html
+editor: visual
+---
+
+```{r}
+library(blackmarbler)
+library(sf)
+library(terra)
+library(ggplot2)
+library(tidyterra)
+library(geodata)
+library(lubridate)
+library(tigris)
+library(dplyr)
+library(tidyr)
+options(tigris_use_cache = TRUE)
+
+bearer <- Sys.getenv("NASA_BEARER")
+
+```
+
+new roi \
+
+```{r}
+islands <- readRDS("/media/volume/fhardie-ntl-data/gadm/gadm41_USA_1_pk.rds") |>
+  unwrap() |> st_as_sf() |> subset(NAME_1 == "Hawaii") |> st_cast("POLYGON")
+cent <- st_coordinates(st_centroid(st_geometry(islands)))
+
+roi_state <- islands[cent[, 1] > -158.8, ]  # HECO islands
+roi_oahu  <- islands[cent[, 1] > -158.4 & cent[, 1] < -157.6 &
+                     cent[, 2] > 21.2   & cent[, 2] < 21.8, ]
+```
+
+```{r}
+oahu_boundary <- counties(state = 'HI', cb = TRUE) %>%   
+  filter(COUNTYFP == '003')
+
+hawaii_places <- places(state = 'HI', cb = TRUE)  
+oahu_places <- st_filter(hawaii_places, oahu_boundary)
+```
+
+```{r}
+vol     <- "/media/volume/fhardie-ntl-data"
+ntl_dir <- file.path(vol, "ntl_baseline")
+
+NOISE_FLOOR <- 3
+
+all_dates <- list(
+  baseline = seq.Date(from = ymd("2025-05-01"), to = ymd("2025-08-03"), by = "day"),
+  storm1   = seq.Date(from = ymd("2026-03-10"), to = ymd("2026-03-16"), by = "day"),
+  gap      = ymd("2026-03-18"),
+  storm2   = seq.Date(from = ymd("2026-03-19"), to = ymd("2026-03-24"), by = "day")
+)
+```
+
+```{r}
+##roi for cropping
+roi_sf <- st_sf(geometry = st_union(st_geometry(roi_oahu)))
+oahu   <- vect(roi_sf)
+nrow(roi_sf)
+```
+
+```{r}
+##find tiles and read dates
+tifs <- list.files(ntl_dir, pattern = "\\.tif$", full.names = TRUE)
+
+get_date <- function(f) {
+  m <- regmatches(basename(f), regexpr("[0-9]{4}_[0-9]{2}_[0-9]{2}", basename(f)))
+  as.Date(gsub("_", "-", m))
+}
+tif_dates <- do.call(c, lapply(tifs, get_date))
+
+stopifnot(length(tifs) > 0, !anyNA(tif_dates))
+length(tifs)
+```
+
+```{r}
+##crop to oahu and build list
+rs <- lapply(tifs, function(f) crop(rast(f), oahu))
+
+r_list <- lapply(names(all_dates), function(p) {
+  idx <- which(tif_dates %in% all_dates[[p]])
+  if (length(idx) == 0) return(NULL)
+  idx <- idx[order(tif_dates[idx])]
+  r <- rast(rs[idx])
+  names(r) <- as.character(tif_dates[idx])
+  r
+})
+names(r_list) <- names(all_dates)
+r_list <- r_list[!sapply(r_list, is.null)]
+
+data.frame(
+  period    = names(all_dates),
+  requested = sapply(all_dates, length),
+  retrieved = sapply(names(all_dates), function(p) if (p %in% names(r_list)) nlyr(r_list[[p]]) else 0)
+)
+```
+
+```{r}
+##baseline mean and noise floor
+ntl <- r_list$baseline
+
+base_mean <- mean(ntl, na.rm = TRUE) |>
+  crop(oahu) |>
+  mask(oahu)
+
+cutoffs <- c(0.5, 1, 2, 3, 4, 5)
+shares  <- sapply(cutoffs, function(f) global(base_mean >= f, "mean", na.rm = TRUE)[[1]])
+setNames(round(shares, 3), cutoffs)
+
+hist(values(base_mean), breaks = 100, main = "Baseline mean radiance, Oahu")
+```
+
+```{r}
+oahu_places <- st_transform(oahu_places, 4326)
+
+keep_mask <- ifel(base_mean >= NOISE_FLOOR, 1, NA)
+
+r_raw <- lapply(r_list, function(r) mask(crop(r, oahu), keep_mask))
+r_log <- lapply(r_raw, log1p)
+
+places_outline <- as.polygons(keep_mask, dissolve = TRUE) |> st_as_sf()
+
+global(keep_mask, "notNA")
+sapply(r_log, nlyr)
+```
+
+```{r}
+##period mean, baseline, zscores
+mean_log <- lapply(r_log, mean, na.rm = TRUE)
+
+base_sd <- stdev(r_log$baseline, na.rm = TRUE)
+base_sd <- ifel(base_sd > 0, base_sd, NA)
+
+zscore <- function(x) (x - mean_log$baseline) / base_sd
+
+z_storm1 <- zscore(mean_log$storm1)
+z_storm2 <- zscore(mean_log$storm2)
+z_gap    <- zscore(mean_log$gap)
+
+z_storm1_nightly <- zscore(r_log$storm1)
+z_storm2_nightly <- zscore(r_log$storm2)
+```
+
+```{r}
+z_all <- list(storm1 = z_storm1, storm2 = z_storm2, gap = z_gap)
+do.call(rbind, lapply(z_all, global, fun = c("min", "mean", "max"), na.rm = TRUE))
+```
+
+```{r}
+##building map function 
+map_metric <- function(r, title, subtitle = NULL, caption = NULL, fill = NULL,
+                       ncol = NULL, lim = NULL) {
+
+  p <- ggplot() +
+    geom_sf(data = roi_oahu, fill = "white", color = "gray45", linewidth = 0.6) +
+    geom_spatraster(data = r) +
+    geom_sf(data = places_outline, fill = NA, color = "gray45", linewidth = 0.4) +
+    scale_fill_gradient2(low = "black", mid = "white", high = "gold1",
+                         midpoint = 0, na.value = "transparent",
+                         limits = lim, oob = scales::squish) +
+    labs(title = title, subtitle = subtitle, caption = caption, fill = fill) +
+    coord_sf() +
+    theme_void() +
+    theme(plot.title    = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(b = 6)),
+          plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 12)),
+          plot.caption  = element_text(size = 9, hjust = 0.5, margin = margin(t = 12)),
+          strip.text    = element_text(size = 12),
+          plot.margin   = margin(20, 20, 20, 20))
+
+  if (!is.null(ncol)) p <- p + facet_wrap(~lyr, ncol = ncol)
+  p
+}
+```
+
+```{r}
+##storm 1 average 
+map_metric(z_storm1,
+           title    = "Nighttime Light Z-Scores: First Kona Low",
+           subtitle = "Average of storm nights, Mar 13-16, 2026, vs. baseline of May 1 - Aug 3, 2025\nSatellite imagery taken at ~1:30 AM local time.",
+           fill     = "Z-Score")
+```
+
+```{r}
+##storm 2 map 
+map_metric(z_storm2,
+           title    = "Nighttime Light Z-Scores: Second Kona Low",
+           subtitle = "Average of storm nights, Mar 19-24, 2026, vs. baseline of May 1 - Aug 3, 2025\nSatellite imagery taken at ~1:30 AM local time.",
+           fill     = "Z-Score")
+```
+
+##fix line
+
+```{r}
+regions <- list(
+  "Leeward"     = c("Nanakuli", "Maili", "Waianae", "Makaha", "Makaha Valley"),
+  "Ewa"         = c("Ewa Villages", "Ewa Beach", "Ewa Gentry", "East Kapolei", "Kapolei", "Makakilo",
+                    "Ko Olina", "Kalaeloa", "Ocean Pointe", "West Loch Estate", "Iroquois Point"),
+  "Central"     = c("Mililani Town", "Mililani Mauka", "Waipio Acres", "Waipio", "Wahiawa", "Whitmore Village",
+                    "Schofield Barracks", "Wheeler AFB", "Helemano", "Royal Kunia", "Waikele", "Waipahu"),
+  "Honolulu"    = c("Urban Honolulu", "East Honolulu",
+                    "Pearl City", "Aiea", "Waimalu", "Halawa", "Hickam Housing"),
+  "Windward"    = c("Kailua", "Kaneohe", "Kaneohe Base", "Kahaluu", "Heeia", "Ahuimanu", "Maunawili",
+                    "Waimanalo", "Waimanalo Beach", "Waiahole-Waikane"),
+  "North Shore" = c("Haleiwa", "Waialua", "Mokuleia", "Pupukea", "Kawela Bay", "Kahuku",
+                    "Laie", "Hauula", "Punaluu", "Kaaawa")
+)
+
+region_lookup <- stack(regions)
+oahu_places$region <- as.character(region_lookup$ind[match(oahu_places$NAME, region_lookup$values)])
+
+v_places  <- vect(oahu_places)
+regions_v <- aggregate(v_places[!is.na(v_places$region), ], by = "region")
+
+table(oahu_places$region, useNA = "ifany")
+```
+
+```{r}
+z_both <- c(z_storm1, z_storm2)
+names(z_both) <- c("First Kona Low", "Second Kona Low")
+
+z_region <- terra::extract(z_both, regions_v, fun = mean, na.rm = TRUE) |>
+  mutate(region = regions_v$region, .before = 1) |>
+  select(-ID) |>
+  pivot_longer(-region, names_to = "storm", values_to = "z")
+
+ggplot(z_region, aes(x = z, y = reorder(region, z), fill = storm)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_vline(xintercept = 0, color = "gray30") +
+  scale_fill_manual(values = c("First Kona Low" = "black", "Second Kona Low" = "gold1")) +
+  labs(title = "Which Storm Hit Which Region Harder?",
+       subtitle = "Mean Nighttime Light Z-Score by Region",
+       x = "Mean Z-Score", y = NULL, fill = NULL) +
+  theme_minimal() +
+  theme(plot.title    = element_text(size = 18, face = "bold", hjust = 0.5, margin = margin(t = 6, b = 6)),
+        plot.subtitle = element_text(size = 12, hjust = 0.5, margin = margin(b = 12)),
+        legend.position = "bottom")
+```
+
+```{r}
+z_pixels <- terra::extract(z_both, v_places) |>
+  mutate(place  = oahu_places$NAME[ID],
+         region = oahu_places$region[ID]) |>
+  pivot_longer(c("First Kona Low", "Second Kona Low"), names_to = "storm", values_to = "z") |>
+  filter(!is.na(z), !is.na(region))
+
+z_pixels |>
+  group_by(region, storm) |>
+  summarise(n_pixels    = n(),
+            mean_z      = mean(z),
+            median_z    = median(z),
+            pct_below_2 = 100 * mean(z < -2),
+            .groups = "drop") |>
+  arrange(region, storm)
+```
+
+```{r}
+
+```

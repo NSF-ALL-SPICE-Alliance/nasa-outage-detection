@@ -1,0 +1,80 @@
+---
+title: "Faith_URE"
+format: html
+editor: visual
+---
+
+## Kona Low analysis for paper
+
+```{r}
+library(blackmarbler)
+library(sf)
+library(terra)
+library(ggplot2)
+library(tidyterra)
+library(geodata)
+library(lubridate)
+options(tigris_use_cache = TRUE)
+
+bearer <- Sys.getenv("NASA_BEARER")
+
+```
+
+### Dates
+
+```{r}
+all_dates <- list(
+  baseline = seq.Date(from = ymd("2025-05-01"), to = ymd("2025-08-03"), by = "day"),
+  storm1   = seq.Date(from = ymd("2026-03-10"), to = ymd("2026-03-16"), by = "day"),
+  gap      = ymd("2026-03-18"),
+  storm2   = seq.Date(from = ymd("2026-03-19"), to = ymd("2026-03-24"), by = "day")
+)
+```
+
+### creating folder
+
+```{r}
+vol <- "/media/volume/fhardie-ntl-data"
+ntl_dir <- file.path(vol, "ntl_baseline")
+h5_dir <- file.path(vol, "ntl_h5_raw")
+
+dir.create(ntl_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(h5_dir,  recursive = TRUE, showWarnings = FALSE)
+```
+
+### Define ROI
+
+```{r}
+roi_sf <- gadm(country = "USA", level = 1, path = file.path(vol)) |>
+  st_as_sf() |>
+  subset(NAME_1 == "Hawaii")
+
+roi_sf
+```
+
+```{r}
+for (period in names(all_dates)) {
+  for (d in as.character(all_dates[[period]])) {
+    tryCatch(
+      bm_raster(roi_sf = roi_sf,
+                product_id = "VNP46A2",
+                variable = "Gap_Filled_DNB_BRDF-Corrected_NTL",
+                quality_flag_rm = 2,
+                date = as.Date(d),
+                bearer = bearer,
+                output_location_type = "file",
+                file_dir = ntl_dir,
+                h5_dir = h5_dir,
+                file_skip_if_exists = TRUE),
+      error = function(e) message("Skipped ", d, ": ", conditionMessage(e))
+    )
+  }
+}
+```
+
+```{r}
+length(list.files(ntl_dir, pattern = "\\.tif$"))
+length(list.files(h5_dir, pattern = "\\.h5$"))
+```
+
+returns 102 and 305\
